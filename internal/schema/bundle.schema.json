@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cps-bundle.invalid/schema/bundle-1.0.0.json",
+  "title": "CPS Bundle normalized support document",
+  "type": "object",
+  "required": ["metadata", "identity", "hardware", "operating_system", "storage", "network", "recent_errors", "software", "findings", "collection"],
+  "properties": {
+    "metadata": {"type": "object", "required": ["schema_version", "collector_version", "bundle_id", "created_at", "lookback", "profile", "privilege", "consent", "redacted", "timezone", "duration_ms"]},
+    "identity": {"type": "object"},
+    "hardware": {"type": "object"},
+    "operating_system": {"type": "object"},
+    "storage": {"type": "object"},
+    "network": {"type": "object"},
+    "recent_errors": {"type": "array", "items": {"type": "object"}},
+    "software": {"type": "array", "items": {"type": "object"}},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "collection": {"type": "object", "required": ["status", "sections", "warnings", "evidence_truncated"]}
+  },
+  "$defs": {"finding": {"type": "object", "required": ["severity", "title", "detail", "suggested_action"], "properties": {"severity": {"enum": ["critical", "warning", "info"]}, "title": {"type": "string"}, "detail": {"type": "string"}, "suggested_action": {"type": "string"}, "evidence": {"type": "string"}}}}
+}

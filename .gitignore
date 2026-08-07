@@ -1,0 +1,5 @@
+/dist/
+/build-check/
+.gocache/
+*.partial
+*.zip

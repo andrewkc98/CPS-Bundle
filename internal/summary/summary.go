@@ -90,6 +90,8 @@ func countItems(value any) int {
 		return len(typed)
 	case []map[string]any:
 		return len(typed)
+	case []string:
+		return len(typed)
 	case map[string]any:
 		for _, key := range []string{"config", "interfaces", "dns", "routes"} {
 			if child, ok := typed[key]; ok {

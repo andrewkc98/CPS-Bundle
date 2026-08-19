@@ -5,6 +5,7 @@ package collect
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -17,9 +18,9 @@ import (
 func platformCollectors(opts model.Options) []Collector {
 	return []Collector{
 		commandCollector("identity", "procfs+dmi", 30*time.Second, linuxIdentity),
-		commandCollector("hardware", "procfs+sysfs", 30*time.Second, linuxHardware),
+		commandCollector("hardware", "procfs+sysfs+lscpu", 30*time.Second, linuxHardware),
 		commandCollector("operating_system", "os-release+uname", 30*time.Second, linuxOS),
-		commandCollector("storage", "lsblk+sysfs", 45*time.Second, func(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
+		commandCollector("storage", "lsblk+findmnt+sysfs", 45*time.Second, func(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
 			return linuxStorage(ctx, opts)
 		}),
 		commandCollector("network", "ip+resolver-config", 30*time.Second, linuxNetwork),
@@ -34,29 +35,42 @@ func platformCollectors(opts model.Options) []Collector {
 
 func linuxIdentity(context.Context) (any, []model.Evidence, []string, []string, bool, error) {
 	host, _ := os.Hostname()
-	return map[string]any{"hostname": host, "architecture": runtime.GOARCH, "manufacturer": readTrim("/sys/class/dmi/id/sys_vendor"), "model": readTrim("/sys/class/dmi/id/product_name"), "serial": readTrim("/sys/class/dmi/id/product_serial"), "virtualization": readTrim("/sys/class/dmi/id/product_version")}, nil, nil, nil, false, nil
-}
-
-func linuxHardware(context.Context) (any, []model.Evidence, []string, []string, bool, error) {
-	modelName := ""
-	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "model name") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					modelName = strings.TrimSpace(parts[1])
-				}
-				break
-			}
+	data := map[string]any{"hostname": host, "architecture": runtime.GOARCH}
+	for key, path := range map[string]string{"manufacturer": "/sys/class/dmi/id/sys_vendor", "model": "/sys/class/dmi/id/product_name", "serial": "/sys/class/dmi/id/product_serial", "virtualization": "/sys/class/dmi/id/product_version"} {
+		if value := readTrim(path); value != "" {
+			data[key] = value
 		}
 	}
-	mem := map[string]any{}
+	return data, nil, nil, nil, false, nil
+}
+
+func linuxHardware(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
+	modelName := ""
+	vendor := ""
+	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		modelName = linuxCPUInfoModel(string(data))
+	}
+	lscpuValue, lscpuRaw, lscpuErr := runJSON(ctx, "lscpu", "-J")
+	if lscpuErr == nil {
+		modelName, vendor = linuxCPUDescription(lscpuValue, modelName)
+	}
+	if modelName == "" || modelName == "-" {
+		modelName = vendor
+	}
+	if modelName == "" || modelName == "-" {
+		modelName = runtime.GOARCH
+	}
+	var memoryTotal, memoryAvailable int64
 	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 && (parts[0] == "MemTotal:" || parts[0] == "MemAvailable:") {
 				n, _ := strconv.ParseInt(parts[1], 10, 64)
-				mem[strings.TrimSuffix(parts[0], ":")] = n * 1024
+				if parts[0] == "MemTotal:" {
+					memoryTotal = n * 1024
+				} else {
+					memoryAvailable = n * 1024
+				}
 			}
 		}
 	}
@@ -64,7 +78,15 @@ func linuxHardware(context.Context) (any, []model.Evidence, []string, []string, 
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
 		uptime, _ = strconv.ParseFloat(strings.Fields(string(data))[0], 64)
 	}
-	return map[string]any{"cpu_model": modelName, "cpu_logical_count": runtime.NumCPU(), "memory_bytes": mem, "uptime_seconds": uptime, "firmware": readTrim("/sys/class/dmi/id/bios_version")}, nil, nil, nil, false, nil
+	data := map[string]any{"cpu_model": modelName, "cpu_logical_count": runtime.NumCPU(), "memory_bytes": memoryTotal, "memory_available_bytes": memoryAvailable, "uptime_seconds": uptime, "firmware": readTrim("/sys/class/dmi/id/bios_version")}
+	if vendor != "" {
+		data["cpu_vendor"] = vendor
+	}
+	evidence := []model.Evidence{}
+	if lscpuRaw != "" {
+		evidence = append(evidence, model.Evidence{Name: "evidence/hardware-lscpu.json", Content: []byte(limit(lscpuRaw, 2<<20))})
+	}
+	return data, evidence, nil, nil, false, nil
 }
 
 func linuxOS(context.Context) (any, []model.Evidence, []string, []string, bool, error) {
@@ -103,7 +125,15 @@ func linuxStorage(ctx context.Context, opts model.Options) (any, []model.Evidenc
 	if err != nil {
 		return map[string]any{"devices": []any{}, "volumes": []any{}, "health": "unavailable"}, nil, nil, nil, false, err
 	}
-	data := map[string]any{"devices": value, "volumes": []any{}, "health": "unknown"}
+	volumes := []any{}
+	warnings := []string{}
+	findmntValue, findmntRaw, findmntErr := runJSON(ctx, "findmnt", "--json", "--bytes", "--real", "--output", "SOURCE,TARGET,FSTYPE,SIZE,USED,AVAIL,USE%")
+	if findmntErr == nil {
+		volumes = parseLinuxVolumes(findmntValue)
+	} else {
+		warnings = append(warnings, "filesystem capacity unavailable")
+	}
+	data := map[string]any{"devices": parseLinuxBlockDevices(value), "volumes": volumes, "health": "unknown"}
 	if opts.NoEnrichers {
 		missing = append(missing, "smartctl", "nvme")
 	} else {
@@ -114,7 +144,11 @@ func linuxStorage(ctx context.Context, opts model.Options) (any, []model.Evidenc
 			missing = append(missing, "nvme")
 		}
 	}
-	return data, []model.Evidence{{Name: "evidence/storage-lsblk.json", Content: []byte(limit(raw, 2<<20))}}, nil, missing, false, nil
+	evidence := []model.Evidence{{Name: "evidence/storage-lsblk.json", Content: []byte(limit(raw, 2<<20))}}
+	if findmntRaw != "" {
+		evidence = append(evidence, model.Evidence{Name: "evidence/storage-findmnt.json", Content: []byte(limit(findmntRaw, 2<<20))})
+	}
+	return data, evidence, warnings, missing, false, nil
 }
 
 func linuxNetwork(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
@@ -128,40 +162,26 @@ func linuxNetwork(ctx context.Context) (any, []model.Evidence, []string, []strin
 		warnings = append(warnings, "route configuration unavailable")
 	}
 	dns := []string{}
-	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && fields[0] == "nameserver" {
-				dns = append(dns, fields[1])
-			}
-		}
+	resolvedRaw := ""
+	if resolved, raw, resolvedErr := runJSON(ctx, "resolvectl", "dns", "--json=short"); resolvedErr == nil {
+		dns = parseLinuxResolvedDNS(resolved)
+		resolvedRaw = raw
+	} else if text, textErr := runText(ctx, "resolvectl", "dns"); textErr == nil {
+		dns = parseLinuxResolvedDNSText(text)
+		resolvedRaw = text
 	}
-	return map[string]any{"interfaces": interfaces, "routes": routes, "dns": dns}, []model.Evidence{{Name: "evidence/network-ip.txt", Content: []byte(limit(rawAddr+"\n"+rawRoute, 2<<20))}}, warnings, nil, false, nil
+	if len(dns) == 0 {
+		dns = parseLinuxResolvConf(readText("/etc/resolv.conf"))
+	}
+	return map[string]any{"interfaces": parseLinuxInterfaces(interfaces), "routes": parseLinuxRoutes(routes), "dns": dns}, []model.Evidence{{Name: "evidence/network-ip.txt", Content: []byte(limit(rawAddr+"\n"+rawRoute+"\n"+resolvedRaw, 2<<20))}}, warnings, nil, false, nil
 }
 
 func linuxErrors(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
-	text, err := runText(ctx, "journalctl", "--no-pager", "--utc", "-p", "err..alert", "--since", "-"+opts.Since.String(), "-o", "json")
+	text, err := runText(ctx, "journalctl", "--no-pager", "--utc", "-p", "err..alert", "--since", "-"+opts.Since.String(), "-n", strconv.Itoa(opts.MaxEvents), "-o", "json")
 	if err != nil {
 		return []map[string]any{}, nil, []string{"journalctl unavailable"}, nil, false, err
 	}
-	var events []map[string]any
-	for _, line := range strings.Split(text, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var raw map[string]any
-		if json.Unmarshal([]byte(line), &raw) != nil {
-			continue
-		}
-		level := "error"
-		if raw["PRIORITY"] == float64(2) {
-			level = "critical"
-		}
-		events = append(events, map[string]any{"timestamp": raw["__REALTIME_TIMESTAMP"], "severity": level, "source": raw["SYSLOG_IDENTIFIER"], "native_code": raw["ERRNO"], "message": raw["MESSAGE"]})
-		if len(events) >= opts.MaxEvents {
-			break
-		}
-	}
+	events := parseLinuxJournal(text, opts.MaxEvents)
 	return events, []model.Evidence{{Name: "evidence/errors-journal.jsonl", Content: []byte(limit(text, 8<<20))}}, nil, nil, len(events) >= opts.MaxEvents, nil
 }
 
@@ -171,9 +191,9 @@ func linuxSoftware(ctx context.Context, opts model.Options) (any, []model.Eviden
 	if _, lookErr := lookupCommand("dpkg-query"); lookErr == nil {
 		text, err = runText(ctx, "dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
 	} else if _, lookErr := lookupCommand("rpm"); lookErr == nil {
-		text, err = runText(ctx, "rpm", "-qa", "--qf", "{NAME}\t{VERSION}-{RELEASE}\t{ARCH}\n")
+		text, err = runText(ctx, "rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n")
 	} else {
-		return []map[string]any{}, nil, []string{"dpkg-query/rpm"}, nil, false, nil
+		return []map[string]any{}, nil, nil, []string{"dpkg-query/rpm"}, false, nil
 	}
 	if err != nil {
 		return []map[string]any{}, nil, nil, nil, false, err
@@ -217,7 +237,7 @@ func linuxSoftware(ctx context.Context, opts model.Options) (any, []model.Eviden
 			}
 		}
 	}
-	return apps, nil, missing, nil, false, nil
+	return apps, nil, nil, missing, false, nil
 }
 
 func readTrim(path string) string {
@@ -227,10 +247,265 @@ func readTrim(path string) string {
 	}
 	return strings.TrimSpace(string(data))
 }
+func readText(path string) string {
+	data, _ := os.ReadFile(path)
+	return string(data)
+}
 func fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
 func limit(value string, max int) string {
 	if len(value) <= max {
 		return value
 	}
 	return value[:max] + "\n[truncated]\n"
+}
+
+func linuxCPUDescription(value any, fallback string) (string, string) {
+	modelName, vendor := fallback, ""
+	root, _ := value.(map[string]any)
+	items, _ := root["lscpu"].([]any)
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		field := strings.TrimSuffix(strings.TrimSpace(fmt.Sprint(item["field"])), ":")
+		data := strings.TrimSpace(fmt.Sprint(item["data"]))
+		switch field {
+		case "Model name":
+			if data != "" && data != "-" {
+				modelName = data
+			}
+		case "Vendor ID":
+			if data != "<nil>" {
+				vendor = data
+			}
+		}
+	}
+	return modelName, vendor
+}
+
+func linuxCPUInfoModel(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := strings.ToLower(strings.TrimSpace(parts[0])), strings.TrimSpace(parts[1])
+		if (key == "model name" || key == "hardware") && value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseLinuxBlockDevices(value any) []any {
+	root, _ := value.(map[string]any)
+	items, _ := root["blockdevices"].([]any)
+	devices := []any{}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if fmt.Sprint(item["type"]) != "disk" {
+			continue
+		}
+		name := strings.TrimSpace(fmt.Sprint(item["name"]))
+		device := map[string]any{"name": "/dev/" + name, "description": stringValue(item["model"], name), "size_bytes": item["size"], "health": "unknown"}
+		if rotational, ok := item["rota"].(bool); ok {
+			device["rotational"] = rotational
+			if rotational {
+				device["media_type"] = "hdd"
+			} else {
+				device["media_type"] = "ssd"
+			}
+		}
+		if serial := stringValue(item["serial"], ""); serial != "" {
+			device["serial"] = serial
+		}
+		devices = append(devices, device)
+	}
+	return devices
+}
+
+func parseLinuxVolumes(value any) []any {
+	root, _ := value.(map[string]any)
+	items, _ := root["filesystems"].([]any)
+	volumes := []any{}
+	var walk func([]any)
+	walk = func(entries []any) {
+		for _, raw := range entries {
+			item, _ := raw.(map[string]any)
+			source, fstype := stringValue(item["source"], ""), stringValue(item["fstype"], "")
+			if source != "" && !strings.HasPrefix(source, "/dev/loop") && fstype != "squashfs" && fstype != "iso9660" {
+				volume := map[string]any{"filesystem": source, "mount_point": stringValue(item["target"], ""), "filesystem_type": fstype, "size_bytes": item["size"], "free_bytes": item["avail"], "health": "unknown"}
+				if used := strings.TrimSuffix(stringValue(item["use%"], ""), "%"); used != "" {
+					if percent, err := strconv.ParseFloat(used, 64); err == nil {
+						volume["used_percent"] = percent
+					}
+				}
+				volumes = append(volumes, volume)
+			}
+			if children, ok := item["children"].([]any); ok {
+				walk(children)
+			}
+		}
+	}
+	walk(items)
+	return volumes
+}
+
+func parseLinuxInterfaces(value any) []map[string]any {
+	items, _ := value.([]any)
+	interfaces := []map[string]any{}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		state := "inactive"
+		if strings.EqualFold(stringValue(item["operstate"], ""), "up") || stringSliceContains(item["flags"], "UP") {
+			state = "active"
+		}
+		addresses := []map[string]any{}
+		if entries, ok := item["addr_info"].([]any); ok {
+			for _, entry := range entries {
+				address, _ := entry.(map[string]any)
+				family := stringValue(address["family"], "")
+				if family == "inet" {
+					family = "ipv4"
+				} else if family == "inet6" {
+					family = "ipv6"
+				}
+				addresses = append(addresses, map[string]any{"family": family, "address": address["local"], "prefix_length": address["prefixlen"], "scope": address["scope"]})
+			}
+		}
+		normalized := map[string]any{"name": item["ifname"], "state": state, "addresses": addresses}
+		if mac := stringValue(item["address"], ""); mac != "" && mac != "00:00:00:00:00:00" {
+			normalized["mac_address"] = mac
+		}
+		interfaces = append(interfaces, normalized)
+	}
+	return interfaces
+}
+
+func parseLinuxRoutes(value any) []map[string]any {
+	items, _ := value.([]any)
+	routes := []map[string]any{}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		route := map[string]any{"destination": item["dst"], "interface": item["dev"]}
+		for source, target := range map[string]string{"gateway": "gateway", "prefsrc": "source", "metric": "metric", "protocol": "protocol"} {
+			if item[source] != nil {
+				route[target] = item[source]
+			}
+		}
+		routes = append(routes, route)
+	}
+	return routes
+}
+
+func parseLinuxResolvedDNS(value any) []string {
+	items, _ := value.([]any)
+	servers, seen := []string{}, map[string]bool{}
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		entries, _ := item["servers"].([]any)
+		for _, entry := range entries {
+			server, _ := entry.(map[string]any)
+			address := stringValue(server["addressString"], "")
+			if address != "" && !seen[address] {
+				servers, seen[address] = append(servers, address), true
+			}
+		}
+	}
+	return servers
+}
+
+func parseLinuxResolvedDNSText(text string) []string {
+	servers, seen := []string{}, map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		for _, address := range strings.Fields(parts[1]) {
+			if !seen[address] {
+				servers, seen[address] = append(servers, address), true
+			}
+		}
+	}
+	return servers
+}
+
+func parseLinuxResolvConf(text string) []string {
+	servers, seen := []string{}, map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "nameserver" && !seen[fields[1]] {
+			servers, seen[fields[1]] = append(servers, fields[1]), true
+		}
+	}
+	return servers
+}
+
+func parseLinuxJournal(text string, maxEvents int) []map[string]any {
+	events := []map[string]any{}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal([]byte(line), &raw) != nil {
+			continue
+		}
+		priority, _ := strconv.Atoi(stringValue(raw["PRIORITY"], "3"))
+		severity := "error"
+		if priority <= 2 {
+			severity = "critical"
+		}
+		source := firstString(raw, "SYSLOG_IDENTIFIER", "_SYSTEMD_UNIT", "_COMM", "_EXE")
+		events = append(events, map[string]any{"timestamp": normalizeLinuxTimestamp(raw["__REALTIME_TIMESTAMP"]), "severity": severity, "source": source, "native_code": raw["ERRNO"], "message": raw["MESSAGE"]})
+		if len(events) >= maxEvents {
+			break
+		}
+	}
+	return events
+}
+
+func normalizeLinuxTimestamp(value any) any {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if microseconds, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return time.UnixMicro(microseconds).UTC().Format(time.RFC3339Nano)
+	}
+	return value
+}
+
+func firstString(value map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text := stringValue(value[key], ""); text != "" {
+			return text
+		}
+	}
+	return "unknown"
+}
+
+func stringValue(value any, fallback string) string {
+	if value == nil {
+		return fallback
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" || text == "<nil>" || text == "-" {
+		return fallback
+	}
+	return text
+}
+
+func stringSliceContains(value any, wanted string) bool {
+	switch items := value.(type) {
+	case []any:
+		for _, item := range items {
+			if fmt.Sprint(item) == wanted {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range items {
+			if item == wanted {
+				return true
+			}
+		}
+	}
+	return false
 }

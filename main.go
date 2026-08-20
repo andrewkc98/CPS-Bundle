@@ -79,6 +79,9 @@ func runCollect(args []string) error {
 		MaxEvents:    *maxEvents,
 		CollectorVer: version,
 	}
+	if err := collect.ValidateOptions(opts); err != nil {
+		return err
+	}
 	if err := collect.Confirm(opts); err != nil {
 		return err
 	}
@@ -94,7 +97,20 @@ func runCollect(args []string) error {
 		return err
 	}
 	fmt.Printf("Support bundle written to %s\n", path)
+	if summary := nonOKSectionSummary(results); summary != "" {
+		fmt.Printf("Collection completed with non-ok sections: %s\n", summary)
+	}
 	return nil
+}
+
+func nonOKSectionSummary(results []model.Result) string {
+	sections := make([]string, 0)
+	for _, result := range results {
+		if result.Status != "ok" && result.Status != "skipped" {
+			sections = append(sections, result.Section+"="+result.Status)
+		}
+	}
+	return strings.Join(sections, ", ")
 }
 
 func splitList(value string) []string {

@@ -46,11 +46,10 @@ func windowsIdentity(ctx context.Context) (any, []model.Evidence, []string, []st
 	if err != nil {
 		return map[string]any{}, nil, nil, nil, false, err
 	}
-	data, _ := value.(map[string]any)
-	if serial, ok := data["serial"].(string); ok && (strings.EqualFold(strings.TrimSpace(serial), "to be filled by o.e.m.") || strings.TrimSpace(serial) == "") {
-		data["serial"] = nil
+	data, err := normalizeWindowsIdentity(value, runtime.GOARCH)
+	if err != nil {
+		return map[string]any{}, nil, nil, nil, false, err
 	}
-	data["architecture"] = runtime.GOARCH
 	return data, nil, nil, nil, false, nil
 }
 
@@ -59,7 +58,10 @@ func windowsHardware(ctx context.Context) (any, []model.Evidence, []string, []st
 	if err != nil {
 		return map[string]any{}, nil, nil, nil, false, err
 	}
-	data, _ := value.(map[string]any)
+	data, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{}, nil, nil, nil, false, fmt.Errorf("Windows hardware response is not an object")
+	}
 	return data, nil, nil, nil, false, nil
 }
 
@@ -68,7 +70,10 @@ func windowsOS(ctx context.Context) (any, []model.Evidence, []string, []string, 
 	if err != nil {
 		return map[string]any{}, nil, nil, nil, false, err
 	}
-	data, _ := value.(map[string]any)
+	data, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{}, nil, nil, nil, false, fmt.Errorf("Windows operating-system response is not an object")
+	}
 	return data, nil, nil, nil, false, nil
 }
 
@@ -79,12 +84,10 @@ func windowsStorage(ctx context.Context, opts model.Options) (any, []model.Evide
 		missing = append(missing, "StorageReliabilityCounter")
 	}
 	if err != nil {
-		return map[string]any{"devices": []any{}, "volumes": []any{}, "health": "unavailable"}, nil, missing, nil, false, err
+		return map[string]any{"devices": []any{}, "volumes": []any{}, "health": "unavailable"}, nil, nil, missing, false, err
 	}
-	if data, ok := value.(map[string]any); ok {
-		return data, []model.Evidence{{Name: "evidence/storage-powershell.json", Content: []byte(raw)}}, missing, nil, false, nil
-	}
-	return map[string]any{"devices": value, "volumes": []any{}, "health": "reported-by-storage-api"}, []model.Evidence{{Name: "evidence/storage-powershell.json", Content: []byte(raw)}}, missing, nil, false, nil
+	evidence, truncated := windowsEvidence("evidence/storage-powershell.json", raw, 8<<20)
+	return normalizeWindowsStorage(value), evidence, nil, missing, truncated, nil
 }
 
 func windowsNetwork(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
@@ -92,37 +95,257 @@ func windowsNetwork(ctx context.Context) (any, []model.Evidence, []string, []str
 	if err != nil {
 		return map[string]any{"interfaces": []any{}, "routes": []any{}, "dns": []any{}}, nil, nil, nil, false, err
 	}
-	if data, ok := value.(map[string]any); ok {
-		return map[string]any{"interfaces": data["config"], "routes": data["routes"], "dns": data["dns"]}, []model.Evidence{{Name: "evidence/network-powershell.json", Content: []byte(raw)}}, nil, nil, false, nil
-	}
-	return map[string]any{"interfaces": []any{}, "routes": []any{}, "dns": []any{}}, []model.Evidence{{Name: "evidence/network-powershell.json", Content: []byte(raw)}}, nil, nil, false, nil
+	evidence, truncated := windowsEvidence("evidence/network-powershell.json", raw, 8<<20)
+	return normalizeWindowsNetwork(value), evidence, nil, nil, truncated, nil
 }
 
 func windowsErrors(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
-	script := fmt.Sprintf("$since=(Get-Date).AddHours(-%.3f); Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2; StartTime=$since} -ErrorAction SilentlyContinue | Select-Object -First %d @{n='timestamp';e={$_.TimeCreated.ToUniversalTime().ToString('o')}},ProviderName,Id,LevelDisplayName,Message | ConvertTo-Json -Depth 4 -Compress", opts.Since.Hours(), opts.MaxEvents)
-	value, raw, err := powershell(ctx, script)
+	script := fmt.Sprintf("$since=(Get-Date).AddHours(-%.3f); $events=Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2; StartTime=$since} -ErrorAction SilentlyContinue | Select-Object -First %d @{n='timestamp';e={$_.TimeCreated.ToUniversalTime().ToString('o')}},ProviderName,Id,Level,Message; @($events) | ConvertTo-Json -Depth 4 -Compress", opts.Since.Hours(), opts.MaxEvents)
+	value, raw, err := powershellEvents(ctx, script)
 	if err != nil {
 		return []map[string]any{}, nil, nil, nil, false, err
 	}
-	return normalizeWindowsEvents(value), []model.Evidence{{Name: "evidence/errors-eventlog.json", Content: []byte(limit(raw, 8<<20))}}, nil, nil, false, nil
+	evidence, truncated := windowsEvidence("evidence/errors-eventlog.json", raw, 8<<20)
+	return normalizeWindowsEvents(value), evidence, nil, nil, truncated, nil
 }
 
 func windowsSoftware(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
-	value, raw, err := powershell(ctx, "$paths='HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object DisplayName | Select-Object @{n='name';e={$_.DisplayName}},@{n='version';e={$_.DisplayVersion}},Publisher,InstallDate | ConvertTo-Json -Depth 4 -Compress")
+	value, raw, err := powershell(ctx, "$paths='HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object DisplayName | Select-Object @{n='name';e={$_.DisplayName}},@{n='version';e={$_.DisplayVersion}},@{n='publisher';e={$_.Publisher}},@{n='install_date';e={$_.InstallDate}} | ConvertTo-Json -Depth 4 -Compress")
 	if err != nil {
 		return []map[string]any{}, nil, nil, nil, false, err
 	}
-	var items []map[string]any
-	if data, ok := value.([]any); ok {
-		for _, item := range data {
-			if m, ok := item.(map[string]any); ok {
-				items = append(items, m)
+	evidence, truncated := windowsEvidence("evidence/software-registry.json", raw, 8<<20)
+	return normalizeWindowsSoftware(value), evidence, nil, nil, truncated, nil
+}
+
+func powershellEvents(ctx context.Context, script string) (any, string, error) {
+	text, err := runText(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	if err != nil {
+		return nil, text, err
+	}
+	value, err := parseWindowsEventsOutput(text)
+	if err != nil {
+		return nil, text, err
+	}
+	return value, text, nil
+}
+
+func parseWindowsEventsOutput(text string) (any, error) {
+	if strings.TrimSpace(text) == "" {
+		return []any{}, nil
+	}
+	var value any
+	if err := json.Unmarshal([]byte(text), &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func normalizeWindowsIdentity(value any, architecture string) (map[string]any, error) {
+	data, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("Windows identity response is not an object")
+	}
+	if serial, ok := data["serial"].(string); ok && (strings.EqualFold(strings.TrimSpace(serial), "to be filled by o.e.m.") || strings.TrimSpace(serial) == "") {
+		data["serial"] = nil
+	}
+	data["architecture"] = architecture
+	return data, nil
+}
+
+func windowsArray(value any) []any {
+	if value == nil {
+		return []any{}
+	}
+	if values, ok := value.([]any); ok {
+		return values
+	}
+	return []any{value}
+}
+
+func normalizeWindowsStorage(value any) map[string]any {
+	data, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{"devices": []any{}, "volumes": []any{}, "health": "reported-by-storage-api"}
+	}
+	devices := make([]any, 0)
+	for _, item := range windowsArray(data["devices"]) {
+		if disk, ok := item.(map[string]any); ok {
+			devices = append(devices, map[string]any{
+				"name":        firstWindowsValue(disk, "FriendlyName", "friendly_name", "name"),
+				"description": firstWindowsValue(disk, "FriendlyName", "friendly_name", "Description", "description"),
+				"serial":      firstWindowsValue(disk, "SerialNumber", "serial_number", "serial"),
+				"media_type":  windowsEnum(firstWindowsValue(disk, "MediaType", "media_type")),
+				"size_bytes":  firstWindowsValue(disk, "Size", "size_bytes"),
+				"health":      windowsEnum(firstWindowsValue(disk, "HealthStatus", "health")),
+			})
+		}
+	}
+	volumes := make([]any, 0)
+	for _, item := range windowsArray(data["volumes"]) {
+		if volume, ok := item.(map[string]any); ok {
+			drive := fmt.Sprint(firstWindowsValue(volume, "drive_letter", "DriveLetter"))
+			if drive == "<nil>" {
+				drive = ""
+			}
+			mountPoint := ""
+			if drive != "" {
+				mountPoint = strings.TrimSuffix(drive, ":") + ":\\"
+			}
+			volumes = append(volumes, map[string]any{
+				"filesystem":      drive,
+				"mount_point":     mountPoint,
+				"filesystem_type": windowsEnum(firstWindowsValue(volume, "filesystem", "FileSystem")),
+				"size_bytes":      firstWindowsValue(volume, "size_bytes", "Size"),
+				"free_bytes":      firstWindowsValue(volume, "free_bytes", "SizeRemaining"),
+				"used_percent":    windowsUsedPercent(volume),
+				"health":          windowsEnum(firstWindowsValue(volume, "health", "HealthStatus")),
+			})
+		}
+	}
+	return map[string]any{"devices": devices, "volumes": volumes, "health": data["health"]}
+}
+
+func normalizeWindowsNetwork(value any) map[string]any {
+	data, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{"interfaces": []any{}, "routes": []any{}, "dns": []any{}}
+	}
+	interfaces := make([]any, 0)
+	for _, item := range windowsArray(data["config"]) {
+		if config, ok := item.(map[string]any); ok {
+			interfaces = append(interfaces, map[string]any{
+				"name":        firstWindowsValue(config, "InterfaceAlias", "interface_alias", "name"),
+				"state":       windowsNetworkState(config),
+				"mac_address": windowsConfigMAC(config),
+				"addresses":   windowsConfigAddresses(config),
+			})
+		}
+	}
+	routes := make([]any, 0)
+	for _, item := range windowsArray(data["routes"]) {
+		if route, ok := item.(map[string]any); ok {
+			routes = append(routes, map[string]any{
+				"destination": firstWindowsValue(route, "DestinationPrefix", "destination"),
+				"gateway":     firstWindowsValue(route, "NextHop", "gateway"),
+				"interface":   firstWindowsValue(route, "InterfaceAlias", "interface"),
+				"metric":      firstWindowsValue(route, "RouteMetric", "metric"),
+				"protocol":    windowsEnum(firstWindowsValue(route, "Protocol", "protocol")),
+			})
+		}
+	}
+	return map[string]any{"interfaces": interfaces, "routes": routes, "dns": windowsDNS(data["dns"])}
+}
+
+func windowsUsedPercent(volume map[string]any) any {
+	if used := firstWindowsValue(volume, "used_percent"); used != nil {
+		return used
+	}
+	size, sizeOK := windowsFloat(firstWindowsValue(volume, "size_bytes", "Size"))
+	free, freeOK := windowsFloat(firstWindowsValue(volume, "free_bytes", "SizeRemaining"))
+	if !sizeOK || !freeOK || size <= 0 {
+		return nil
+	}
+	return float64(int((100*(1-free/size))*100+0.5)) / 100
+}
+
+func windowsFloat(value any) (float64, bool) {
+	switch number := value.(type) {
+	case float64:
+		return number, true
+	case float32:
+		return float64(number), true
+	case int:
+		return float64(number), true
+	case int64:
+		return float64(number), true
+	case json.Number:
+		parsed, err := number.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func windowsEnum(value any) string {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" || text == "<nil>" {
+		return "unknown"
+	}
+	return strings.ToLower(text)
+}
+
+func windowsNetworkState(config map[string]any) any {
+	value := firstWindowsValue(config, "Status", "status")
+	if adapter, ok := firstWindowsValue(config, "NetAdapter", "net_adapter").(map[string]any); ok {
+		value = firstWindowsValue(adapter, "Status", "status")
+	}
+	state := strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+	if state == "up" || state == "connected" {
+		return "active"
+	}
+	return "inactive"
+}
+
+func windowsConfigMAC(config map[string]any) any {
+	if adapter, ok := firstWindowsValue(config, "NetAdapter", "net_adapter").(map[string]any); ok {
+		return firstWindowsValue(adapter, "MacAddress", "mac_address")
+	}
+	return firstWindowsValue(config, "MacAddress", "mac_address")
+}
+
+func windowsConfigAddresses(config map[string]any) []any {
+	addresses := make([]any, 0)
+	for _, family := range []struct{ key, name string }{{"IPv4Address", "ipv4"}, {"IPv6Address", "ipv6"}} {
+		for _, item := range windowsArray(config[family.key]) {
+			if address, ok := item.(map[string]any); ok {
+				addresses = append(addresses, map[string]any{"family": family.name, "address": firstWindowsValue(address, "IPAddress", "address"), "prefix_length": firstWindowsValue(address, "PrefixLength", "prefix_length")})
 			}
 		}
-	} else if item, ok := value.(map[string]any); ok {
-		items = append(items, item)
 	}
-	return items, []model.Evidence{{Name: "evidence/software-registry.json", Content: []byte(limit(raw, 8<<20))}}, nil, nil, false, nil
+	return addresses
+}
+
+func windowsDNS(value any) []string {
+	servers := make([]string, 0)
+	seen := map[string]bool{}
+	for _, item := range windowsArray(value) {
+		if config, ok := item.(map[string]any); ok {
+			for _, address := range windowsArray(firstWindowsValue(config, "ServerAddresses", "server_addresses")) {
+				text, ok := address.(string)
+				if ok && text != "" && !seen[text] {
+					seen[text] = true
+					servers = append(servers, text)
+				}
+			}
+		}
+	}
+	return servers
+}
+
+func normalizeWindowsSoftware(value any) []map[string]any {
+	items := make([]map[string]any, 0)
+	for _, item := range windowsArray(value) {
+		data, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		items = append(items, map[string]any{"name": data["name"], "version": data["version"], "publisher": firstWindowsValue(data, "publisher", "Publisher"), "install_date": firstWindowsValue(data, "install_date", "InstallDate"), "install_scope": "system", "source": "registry"})
+	}
+	return items
+}
+
+func firstWindowsValue(data map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := data[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func windowsEvidence(name, raw string, max int) ([]model.Evidence, bool) {
+	return []model.Evidence{{Name: name, Content: []byte(limit(raw, max))}}, len(raw) > max
 }
 
 func normalizeWindowsEvents(value any) []map[string]any {
@@ -135,16 +358,32 @@ func normalizeWindowsEvents(value any) []map[string]any {
 	items := make([]map[string]any, 0, len(rawItems))
 	for _, item := range rawItems {
 		if m, ok := item.(map[string]any); ok {
-			severity := strings.ToLower(fmt.Sprint(m["LevelDisplayName"]))
-			if severity == "error" {
-				severity = "error"
-			} else {
+			severity := "error"
+			if level, ok := windowsEventLevel(m["Level"]); ok && level == 1 {
 				severity = "critical"
 			}
-			items = append(items, map[string]any{"timestamp": m["timestamp"], "severity": severity, "source": m["ProviderName"], "native_code": m["Id"], "message": m["Message"]})
+			source := strings.TrimSpace(fmt.Sprint(m["ProviderName"]))
+			if source == "" || source == "<nil>" {
+				source = "unknown"
+			}
+			items = append(items, map[string]any{"timestamp": m["timestamp"], "severity": severity, "source": source, "native_code": m["Id"], "message": m["Message"]})
 		}
 	}
 	return items
+}
+
+func windowsEventLevel(value any) (int, bool) {
+	switch level := value.(type) {
+	case float64:
+		return int(level), level == 1 || level == 2
+	case int:
+		return level, level == 1 || level == 2
+	case json.Number:
+		parsed, err := level.Int64()
+		return int(parsed), err == nil && (parsed == 1 || parsed == 2)
+	default:
+		return 0, false
+	}
 }
 
 func limit(value string, max int) string {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ type manifest struct {
 	Files            []manifestFile `json:"files"`
 }
 
+type sudoIdentity struct {
+	uid int
+	gid int
+}
+
 func Write(opts model.Options, doc model.Bundle, results []model.Result) (string, error) {
 	if err := schema.ValidateBundle(doc); err != nil {
 		return "", err
@@ -45,10 +51,23 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 	logLines := []string{}
 	const evidenceLimit = 50 << 20
 	usedEvidence := 0
+	if opts.Redact {
+		doc.Collection.Warnings = append(doc.Collection.Warnings, "Raw evidence files were omitted because redaction was requested.")
+	}
 	for _, result := range results {
-		logLines = append(logLines, fmt.Sprintf("%s\t%s\t%dms\t%s\t%s", result.Section, result.Status, result.DurationMS, result.Source, result.Error))
+		errorText := result.Error
+		if opts.Redact && errorText != "" {
+			errorText = "[REDACTED]"
+		}
+		logLines = append(logLines, fmt.Sprintf("%s\t%s\t%dms\t%s\t%s", result.Section, result.Status, result.DurationMS, result.Source, errorText))
+		if opts.Redact {
+			continue
+		}
 		for _, evidence := range result.Evidence {
-			if len(evidence.Content) == 0 || usedEvidence >= evidenceLimit {
+			if len(evidence.Content) == 0 {
+				continue
+			}
+			if usedEvidence >= evidenceLimit {
 				doc.Collection.EvidenceTruncated = true
 				continue
 			}
@@ -72,7 +91,11 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 		return "", err
 	}
 	files["bundle.json"] = append(jsonData, '\n')
-	files["00-summary.html"] = summary.RenderHTML(doc)
+	summaryHTML := summary.RenderHTML(doc)
+	if opts.Redact {
+		summaryHTML = appendSummaryWarning(summaryHTML, "Raw evidence files were omitted because redaction was requested.")
+	}
+	files["00-summary.html"] = summaryHTML
 	files["schema/bundle.schema.json"] = []byte(schema.Document)
 	sort.Strings(logLines)
 	files["collection.log"] = []byte(strings.Join(logLines, "\n") + "\n")
@@ -106,7 +129,7 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 		return "", err
 	}
 
-	destination, err := destinationPath(opts.Output, doc)
+	destination, outputDirectory, err := destinationPath(opts.Output, doc)
 	if err != nil {
 		return "", err
 	}
@@ -115,52 +138,135 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+	createdDirs, err := ensureOutputDirectory(outputDirectory)
+	if err != nil {
 		return "", err
 	}
 	partial := destination + ".partial"
-	if _, err := os.Stat(partial); err == nil {
-		return "", fmt.Errorf("temporary output already exists: %s", partial)
-	}
-	if err := zipDir(partial, temp, files); err != nil {
-		os.Remove(partial)
+	created, err := zipDir(partial, temp, files)
+	if err != nil {
+		if created {
+			os.Remove(partial)
+		}
 		return "", err
 	}
 	if err := os.Rename(partial, destination); err != nil {
 		os.Remove(partial)
 		return "", err
 	}
+	identity, err := parseSudoIdentity(os.Getenv)
+	if err != nil {
+		return "", fmt.Errorf("archive exists at %s, but ownership correction could not be configured: %w", destination, err)
+	}
+	if identity != nil {
+		if err := applyOwnership(destination, createdDirs, identity.uid, identity.gid); err != nil {
+			return "", fmt.Errorf("archive exists at %s, but ownership correction failed: %w", destination, err)
+		}
+	}
 	return destination, nil
 }
 
-func destinationPath(output string, doc model.Bundle) (string, error) {
+func destinationPath(output string, doc model.Bundle) (string, string, error) {
 	if output == "" {
 		output = "."
 	}
 	info, err := os.Stat(output)
 	if err == nil && info.IsDir() {
-		return filepath.Join(output, fmt.Sprintf("cps-bundle_%s_%s.zip", safe(doc.Identity["hostname"]), time.Now().UTC().Format("20060102T150405Z"))), nil
+		return filepath.Join(output, archiveName(doc)), filepath.Clean(output), nil
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", err
+		return "", "", err
 	}
 	if strings.HasSuffix(strings.ToLower(output), ".zip") {
-		return filepath.Clean(output), nil
+		destination := filepath.Clean(output)
+		return destination, filepath.Dir(destination), nil
 	}
-	if err := os.MkdirAll(output, 0700); err != nil {
-		return "", err
+	if err == nil {
+		return "", "", fmt.Errorf("output path is not a directory: %s", output)
 	}
-	return filepath.Join(output, fmt.Sprintf("cps-bundle_%s_%s.zip", safe(doc.Identity["hostname"]), time.Now().UTC().Format("20060102T150405Z"))), nil
+	directory := filepath.Clean(output)
+	return filepath.Join(directory, archiveName(doc)), directory, nil
 }
 
-func zipDir(destination, root string, files map[string][]byte) error {
-	file, err := os.Create(destination)
+func archiveName(doc model.Bundle) string {
+	return fmt.Sprintf("cps-bundle_%s_%s.zip", safe(doc.Identity["hostname"]), time.Now().UTC().Format("20060102T150405Z"))
+}
+
+func ensureOutputDirectory(directory string) ([]string, error) {
+	directory = filepath.Clean(directory)
+	missing := []string{}
+	for current := directory; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return nil, fmt.Errorf("output path component is not a directory: %s", current)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil, fmt.Errorf("no existing parent directory for output: %s", directory)
+		}
+		missing = append(missing, current)
+	}
+	created := make([]string, 0, len(missing))
+	for index := len(missing) - 1; index >= 0; index-- {
+		path := missing[index]
+		if err := os.Mkdir(path, 0700); err == nil {
+			created = append(created, path)
+			continue
+		} else if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("output path component is not a directory: %s", path)
+		}
+	}
+	return created, nil
+}
+
+func parseSudoIdentity(lookup func(string) string) (*sudoIdentity, error) {
+	uidText := lookup("SUDO_UID")
+	gidText := lookup("SUDO_GID")
+	if uidText == "" && gidText == "" {
+		return nil, nil
+	}
+	if uidText == "" || gidText == "" {
+		return nil, errors.New("sudo ownership correction requires both numeric SUDO_UID and SUDO_GID")
+	}
+	uid, err := parseID(uidText)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("invalid SUDO_UID for ownership correction: %w", err)
+	}
+	gid, err := parseID(gidText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SUDO_GID for ownership correction: %w", err)
+	}
+	return &sudoIdentity{uid: uid, gid: gid}, nil
+}
+
+func parseID(value string) (int, error) {
+	parsed, err := strconv.ParseUint(value, 10, 31)
+	if err != nil {
+		return 0, fmt.Errorf("must be a non-negative decimal integer")
+	}
+	return int(parsed), nil
+}
+
+func zipDir(destination, root string, files map[string][]byte) (bool, error) {
+	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return false, err
 	}
 	defer file.Close()
 	archive := zip.NewWriter(file)
-	defer archive.Close()
 	paths := make([]string, 0, len(files))
 	for path := range files {
 		paths = append(paths, path)
@@ -169,17 +275,32 @@ func zipDir(destination, root string, files map[string][]byte) error {
 	for _, path := range paths {
 		entry, err := archive.Create(filepath.ToSlash(path))
 		if err != nil {
-			return err
+			archive.Close()
+			return true, err
 		}
 		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 		if err != nil {
-			return err
+			archive.Close()
+			return true, err
 		}
 		if _, err := io.Copy(entry, bytes.NewReader(data)); err != nil {
-			return err
+			archive.Close()
+			return true, err
 		}
 	}
-	return nil
+	if err := archive.Close(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func appendSummaryWarning(summaryHTML []byte, warning string) []byte {
+	const closingFooter = "</footer>"
+	message := []byte("<br><strong>Warning:</strong> " + warning)
+	if index := bytes.Index(summaryHTML, []byte(closingFooter)); index >= 0 {
+		return append(append(append([]byte(nil), summaryHTML[:index]...), message...), summaryHTML[index:]...)
+	}
+	return append(summaryHTML, message...)
 }
 func safe(value any) string {
 	text := fmt.Sprint(value)

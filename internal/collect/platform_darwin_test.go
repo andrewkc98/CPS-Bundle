@@ -21,6 +21,35 @@ func TestMacLogLookbackRoundsUp(t *testing.T) {
 	}
 }
 
+func TestAppendBoundedMacEvidenceKeepsWholeLinesAndMarksTruncation(t *testing.T) {
+	evidence, truncated := appendBoundedMacEvidence(nil, []byte("first"), 12)
+	if truncated || string(evidence) != "first\n" {
+		t.Fatalf("unexpected first append: %q, truncated=%v", evidence, truncated)
+	}
+	evidence, truncated = appendBoundedMacEvidence(evidence, []byte("second-line"), 12)
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	want := "first\n" + macEvidenceTruncationMarker
+	if string(evidence) != want {
+		t.Fatalf("evidence retained a partial line or marker was wrong: %q", evidence)
+	}
+	if len(evidence) > 12+macEvidenceTruncationMarkerBytes {
+		t.Fatalf("evidence exceeded content cap plus marker allowance: %d", len(evidence))
+	}
+	again, stillTruncated := appendBoundedMacEvidence(evidence, []byte("later"), 12)
+	if !stillTruncated || string(again) != want {
+		t.Fatalf("truncation marker should be added only once: %q", again)
+	}
+}
+
+func TestAppendBoundedMacEvidenceOversizedFirstLineStoresOnlyMarker(t *testing.T) {
+	evidence, truncated := appendBoundedMacEvidence(nil, []byte("too-long"), 3)
+	if !truncated || string(evidence) != macEvidenceTruncationMarker {
+		t.Fatalf("unexpected oversized line handling: %q, truncated=%v", evidence, truncated)
+	}
+}
+
 func TestParseMacStorageAndNetwork(t *testing.T) {
 	volumes := parseMacVolumes("/dev/disk3s5 1000 750 250 75% /System/Volumes/Data\n")
 	if len(volumes) != 1 {

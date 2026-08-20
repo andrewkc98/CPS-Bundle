@@ -92,7 +92,8 @@ func macOS(ctx context.Context) (any, []model.Evidence, []string, []string, bool
 	version, _ := runText(ctx, "sw_vers", "-productVersion")
 	build, _ := runText(ctx, "sw_vers", "-buildVersion")
 	history, _ := runText(ctx, "softwareupdate", "--history")
-	return map[string]any{"family": "darwin", "name": strings.TrimSpace(name), "version": strings.TrimSpace(version), "build": strings.TrimSpace(build), "kernel": strings.TrimSpace(mustText("uname", "-r")), "last_updates": strings.TrimSpace(limit(history, 2<<20)), "reboot_pending": false}, nil, nil, nil, false, nil
+	kernel, _ := runText(ctx, "uname", "-r")
+	return map[string]any{"family": "darwin", "name": strings.TrimSpace(name), "version": strings.TrimSpace(version), "build": strings.TrimSpace(build), "kernel": strings.TrimSpace(kernel), "last_updates": strings.TrimSpace(limit(history, 2<<20))}, nil, nil, nil, false, nil
 }
 func macStorage(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
 	text, err := runText(ctx, "diskutil", "list")
@@ -125,7 +126,7 @@ func macNetwork(ctx context.Context) (any, []model.Evidence, []string, []string,
 }
 func macErrors(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
 	lookback := macLogLookback(opts.Since)
-	text, events, truncated, timedOut, err := collectMacLog(ctx, lookback, opts.MaxEvents)
+	text, events, eventsTruncated, evidenceTruncated, timedOut, err := collectMacLog(ctx, lookback, opts.MaxEvents)
 	if err != nil {
 		return []map[string]any{}, nil, nil, nil, false, fmt.Errorf("log show failed for %s: %w", lookback, err)
 	}
@@ -133,43 +134,41 @@ func macErrors(ctx context.Context, opts model.Options) (any, []model.Evidence, 
 	if timedOut {
 		warnings = append(warnings, fmt.Sprintf("unified log collection timed out after yielding %d events", len(events)))
 	}
-	if truncated {
+	if eventsTruncated {
 		warnings = append(warnings, fmt.Sprintf("recent errors limited to %d events", opts.MaxEvents))
+	}
+	if evidenceTruncated {
+		warnings = append(warnings, "unified log evidence limited to 8 MiB")
 	}
 	evidence := []model.Evidence{}
 	if text != "" {
 		evidence = append(evidence, model.Evidence{Name: "evidence/errors-unified-log.ndjson", Content: []byte(text)})
 	}
-	return events, evidence, warnings, nil, truncated, nil
+	return events, evidence, warnings, nil, eventsTruncated || evidenceTruncated, nil
 }
 
-func collectMacLog(ctx context.Context, lookback string, maxEvents int) (string, []map[string]any, bool, bool, error) {
+func collectMacLog(ctx context.Context, lookback string, maxEvents int) (string, []map[string]any, bool, bool, bool, error) {
 	cmd := exec.CommandContext(ctx, "log", "show", "--style", "ndjson", "--last", lookback, "--predicate", "messageType == error OR messageType == fault")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", nil, false, false, err
+		return "", nil, false, false, false, err
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return "", nil, false, false, err
+		return "", nil, false, false, false, err
 	}
 
 	events := make([]map[string]any, 0, maxEvents)
-	var evidence strings.Builder
+	evidence := make([]byte, 0, macEvidenceContentCap)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	truncated := false
+	eventsTruncated := false
+	evidenceTruncated := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if evidence.Len() < 8<<20 {
-			remaining := (8 << 20) - evidence.Len()
-			if len(line)+1 <= remaining {
-				evidence.Write(line)
-				evidence.WriteByte('\n')
-			} else {
-				evidence.Write(line[:remaining])
-			}
+		if !evidenceTruncated {
+			evidence, evidenceTruncated = appendBoundedMacEvidence(evidence, line, macEvidenceContentCap)
 		}
 		var record map[string]any
 		if json.Unmarshal(line, &record) != nil {
@@ -177,30 +176,53 @@ func collectMacLog(ctx context.Context, lookback string, maxEvents int) (string,
 		}
 		events = append(events, normalizeMacLogRecord(record))
 		if len(events) >= maxEvents {
-			truncated = true
+			eventsTruncated = true
 			_ = cmd.Process.Kill()
 			break
 		}
 	}
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
-	if truncated {
-		return evidence.String(), events, true, false, nil
+	if eventsTruncated {
+		return string(evidence), events, true, evidenceTruncated, false, nil
 	}
 	if ctx.Err() != nil {
-		return evidence.String(), events, false, true, nil
+		return string(evidence), events, false, evidenceTruncated, true, nil
 	}
 	if scanErr != nil {
-		return evidence.String(), events, false, false, scanErr
+		return string(evidence), events, false, evidenceTruncated, false, scanErr
 	}
 	if waitErr != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message != "" {
-			return evidence.String(), events, false, false, fmt.Errorf("%w: %s", waitErr, message)
+			return string(evidence), events, false, evidenceTruncated, false, fmt.Errorf("%w: %s", waitErr, message)
 		}
-		return evidence.String(), events, false, false, waitErr
+		return string(evidence), events, false, evidenceTruncated, false, waitErr
 	}
-	return evidence.String(), events, false, false, nil
+	return string(evidence), events, false, evidenceTruncated, false, nil
+}
+
+const (
+	// macEvidenceContentCap bounds log content. The explicit marker may add
+	// macEvidenceTruncationMarkerBytes beyond this cap, so the total stored
+	// evidence is at most their sum and always ends on a complete log line.
+	macEvidenceContentCap            = 8 << 20
+	macEvidenceTruncationMarker      = "[truncated by evidence cap]\n"
+	macEvidenceTruncationMarkerBytes = len(macEvidenceTruncationMarker)
+)
+
+// appendBoundedMacEvidence appends complete NDJSON lines until contentCap is
+// reached. If the next line will not fit, it appends one explicit marker and
+// reports truncation without retaining a partial line.
+func appendBoundedMacEvidence(evidence, line []byte, contentCap int) ([]byte, bool) {
+	if bytes.HasSuffix(evidence, []byte(macEvidenceTruncationMarker)) {
+		return evidence, true
+	}
+	if len(evidence)+len(line)+1 <= contentCap {
+		evidence = append(evidence, line...)
+		return append(evidence, '\n'), false
+	}
+	return append(evidence, macEvidenceTruncationMarker...), true
 }
 
 func macLogLookback(duration time.Duration) string {
@@ -241,6 +263,9 @@ func normalizeMacLogRecord(record map[string]any) map[string]any {
 	source := record["subsystem"]
 	if source == nil || fmt.Sprint(source) == "" {
 		source = record["process"]
+	}
+	if source == nil || fmt.Sprint(source) == "" {
+		source = "unknown"
 	}
 	return map[string]any{"timestamp": normalizeMacTimestamp(record["timestamp"]), "severity": severity, "source": source, "native_code": record["category"], "message": record["eventMessage"]}
 }

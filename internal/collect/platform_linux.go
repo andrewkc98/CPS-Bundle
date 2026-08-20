@@ -76,7 +76,9 @@ func linuxHardware(ctx context.Context) (any, []model.Evidence, []string, []stri
 	}
 	uptime := 0.0
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
-		uptime, _ = strconv.ParseFloat(strings.Fields(string(data))[0], 64)
+		if fields := strings.Fields(string(data)); len(fields) > 0 {
+			uptime, _ = strconv.ParseFloat(fields[0], 64)
+		}
 	}
 	data := map[string]any{"cpu_model": modelName, "cpu_logical_count": runtime.NumCPU(), "memory_bytes": memoryTotal, "memory_available_bytes": memoryAvailable, "uptime_seconds": uptime, "firmware": readTrim("/sys/class/dmi/id/bios_version")}
 	if vendor != "" {
@@ -89,8 +91,9 @@ func linuxHardware(ctx context.Context) (any, []model.Evidence, []string, []stri
 	return data, evidence, nil, nil, false, nil
 }
 
-func linuxOS(context.Context) (any, []model.Evidence, []string, []string, bool, error) {
-	values := map[string]any{"family": "linux", "kernel": strings.TrimSpace(mustText("uname", "-r")), "architecture": runtime.GOARCH, "reboot_pending": fileExists("/var/run/reboot-required"), "last_updates": linuxUpdateHistory()}
+func linuxOS(ctx context.Context) (any, []model.Evidence, []string, []string, bool, error) {
+	kernel, _ := runText(ctx, "uname", "-r")
+	values := map[string]any{"family": "linux", "kernel": strings.TrimSpace(kernel), "architecture": runtime.GOARCH, "reboot_pending": fileExists("/var/run/reboot-required"), "last_updates": linuxUpdateHistory()}
 	if data, err := os.ReadFile("/etc/os-release"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			parts := strings.SplitN(line, "=", 2)
@@ -177,7 +180,7 @@ func linuxNetwork(ctx context.Context) (any, []model.Evidence, []string, []strin
 }
 
 func linuxErrors(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
-	text, err := runText(ctx, "journalctl", "--no-pager", "--utc", "-p", "err..alert", "--since", "-"+opts.Since.String(), "-n", strconv.Itoa(opts.MaxEvents), "-o", "json")
+	text, err := runText(ctx, "journalctl", "--no-pager", "--utc", "-p", "err..alert", "--since", linuxJournalSince(opts.Since), "-n", strconv.Itoa(opts.MaxEvents), "-o", "json")
 	if err != nil {
 		return []map[string]any{}, nil, []string{"journalctl unavailable"}, nil, false, err
 	}
@@ -188,11 +191,19 @@ func linuxErrors(ctx context.Context, opts model.Options) (any, []model.Evidence
 func linuxSoftware(ctx context.Context, opts model.Options) (any, []model.Evidence, []string, []string, bool, error) {
 	var text string
 	var err error
-	if _, lookErr := lookupCommand("dpkg-query"); lookErr == nil {
-		text, err = runText(ctx, "dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
-	} else if _, lookErr := lookupCommand("rpm"); lookErr == nil {
-		text, err = runText(ctx, "rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n")
-	} else {
+	manager := ""
+	for _, candidate := range linuxPackageManagerOrder(readText("/etc/os-release")) {
+		if _, lookErr := lookupCommand(candidate); lookErr == nil {
+			manager = candidate
+			break
+		}
+	}
+	switch manager {
+	case "dpkg-query":
+		text, err = runText(ctx, manager, "-W", "-f=${Package}\t${Version}\t${Architecture}\n")
+	case "rpm":
+		text, err = runText(ctx, manager, "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n")
+	default:
 		return []map[string]any{}, nil, nil, []string{"dpkg-query/rpm"}, false, nil
 	}
 	if err != nil {
@@ -238,6 +249,32 @@ func linuxSoftware(ctx context.Context, opts model.Options) (any, []model.Eviden
 		}
 	}
 	return apps, nil, nil, missing, false, nil
+}
+
+func linuxJournalSince(duration time.Duration) string {
+	seconds := int64((duration + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return "-" + strconv.FormatInt(seconds, 10) + "s"
+}
+
+func linuxPackageManagerOrder(osRelease string) []string {
+	values := map[string]string{}
+	for _, line := range strings.Split(osRelease, "\n") {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			values[strings.ToLower(strings.TrimSpace(parts[0]))] = strings.ToLower(strings.Trim(strings.TrimSpace(parts[1]), "\""))
+		}
+	}
+	family := strings.Fields(values["id"] + " " + values["id_like"])
+	for _, item := range family {
+		switch item {
+		case "rhel", "fedora", "centos", "rocky", "almalinux", "ol", "suse", "opensuse":
+			return []string{"rpm", "dpkg-query"}
+		}
+	}
+	return []string{"dpkg-query", "rpm"}
 }
 
 func readTrim(path string) string {

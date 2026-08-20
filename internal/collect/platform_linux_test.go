@@ -4,7 +4,9 @@ package collect
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
+	"time"
 )
 
 func TestLinuxNormalization(t *testing.T) {
@@ -60,6 +62,21 @@ func TestLinuxJournalNormalization(t *testing.T) {
 	events := parseLinuxJournal(`{"__REALTIME_TIMESTAMP":"1787120613648330","PRIORITY":"2","_SYSTEMD_UNIT":"example.service","MESSAGE":"failed"}`+"\n", 10)
 	if len(events) != 1 || events[0]["severity"] != "critical" || events[0]["source"] != "example.service" || events[0]["timestamp"] != "2026-08-19T06:23:33.64833Z" {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestLinuxJournalSinceUsesSystemdDuration(t *testing.T) {
+	if got := linuxJournalSince(72*time.Hour + 500*time.Millisecond); got != "-259201s" {
+		t.Fatalf("unexpected journal lookback: %q", got)
+	}
+}
+
+func TestLinuxPackageManagerOrderFollowsOSFamily(t *testing.T) {
+	if got := linuxPackageManagerOrder("ID=rhel\nID_LIKE=\"fedora\"\n"); !reflect.DeepEqual(got, []string{"rpm", "dpkg-query"}) {
+		t.Fatalf("unexpected RHEL order: %#v", got)
+	}
+	if got := linuxPackageManagerOrder("ID=ubuntu\nID_LIKE=debian\n"); !reflect.DeepEqual(got, []string{"dpkg-query", "rpm"}) {
+		t.Fatalf("unexpected Debian order: %#v", got)
 	}
 }
 

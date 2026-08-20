@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net"
 	"strings"
 	"time"
 )
@@ -114,8 +115,8 @@ func Redact(b *Bundle) {
 		case map[string]any:
 			for key, item := range v {
 				lower := strings.ToLower(key)
-				if strings.Contains(lower, "serial") || strings.Contains(lower, "hostname") || strings.Contains(lower, "username") || strings.Contains(lower, "ssid") || strings.Contains(lower, "mac") || strings.Contains(lower, "public_ip") || strings.Contains(lower, "ip_address") || lower == "ip" || lower == "address" {
-					v[key] = "[REDACTED]"
+				if sensitiveField(lower) {
+					v[key] = redactedValue(item)
 				} else {
 					v[key] = walk(item)
 				}
@@ -123,6 +124,20 @@ func Redact(b *Bundle) {
 		case []any:
 			for i := range v {
 				v[i] = walk(v[i])
+			}
+		case []map[string]any:
+			for i := range v {
+				walk(v[i])
+			}
+		case []string:
+			for i := range v {
+				if isNetworkIdentifier(v[i]) {
+					v[i] = "[REDACTED]"
+				}
+			}
+		case string:
+			if isNetworkIdentifier(v) {
+				return "[REDACTED]"
 			}
 		}
 		return value
@@ -138,5 +153,41 @@ func Redact(b *Bundle) {
 	for i := range b.Software {
 		walk(b.Software[i])
 	}
+	for name, status := range b.Collection.Sections {
+		if status.Error != "" {
+			status.Error = "[REDACTED]"
+			b.Collection.Sections[name] = status
+		}
+	}
 	b.Metadata.Redacted = true
+}
+
+func sensitiveField(key string) bool {
+	return strings.Contains(key, "serial") || strings.Contains(key, "hostname") ||
+		strings.Contains(key, "username") || strings.Contains(key, "ssid") ||
+		strings.Contains(key, "mac") || strings.Contains(key, "public_ip") ||
+		strings.Contains(key, "ip_address") || key == "ip" || key == "address" ||
+		key == "raw" || key == "message" || key == "last_updates"
+}
+
+func redactedValue(value any) any {
+	switch value.(type) {
+	case []string:
+		return []string{"[REDACTED]"}
+	case []any:
+		return []any{"[REDACTED]"}
+	default:
+		return "[REDACTED]"
+	}
+}
+
+func isNetworkIdentifier(value string) bool {
+	value = strings.TrimSpace(value)
+	if net.ParseIP(strings.Trim(value, "[]")) != nil {
+		return true
+	}
+	if _, _, err := net.ParseCIDR(value); err == nil {
+		return true
+	}
+	return false
 }

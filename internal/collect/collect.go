@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +51,9 @@ func Run(opts model.Options) (model.Bundle, []model.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	collectors := platformCollectors(opts)
+	if err := validateSelections(collectors, opts); err != nil {
+		return b, nil, err
+	}
 	var wg sync.WaitGroup
 	results := make(chan model.Result, len(collectors))
 	for _, collector := range collectors {
@@ -63,23 +65,7 @@ func Run(opts model.Options) (model.Bundle, []model.Result, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			begin := time.Now()
-			localCtx, stop := context.WithTimeout(ctx, collector.Timeout)
-			defer stop()
-			data, evidence, warnings, missing, truncated, err := collector.Run(localCtx)
-			status := "ok"
-			if err != nil {
-				status = "failed"
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(localCtx.Err(), context.DeadlineExceeded) {
-					status = "unavailable"
-				}
-			}
-			if len(warnings) > 0 || len(missing) > 0 || truncated {
-				if status == "ok" {
-					status = "partial"
-				}
-			}
-			results <- model.Result{Section: collector.Section, Source: collector.Source, Status: status, Data: data, Evidence: evidence, Warnings: warnings, MissingTools: missing, Error: errorText(err), DurationMS: time.Since(begin).Milliseconds(), Truncated: truncated}
+			results <- runCollector(ctx, collector)
 		}()
 	}
 	wg.Wait()
@@ -96,16 +82,86 @@ func Run(opts model.Options) (model.Bundle, []model.Result, error) {
 	if len(ordered) == 0 {
 		return b, nil, errors.New("no collectors selected")
 	}
-	if b.Collection.Status == "ok" {
-		for _, status := range b.Collection.Sections {
-			if status.Status != "ok" {
-				b.Collection.Status = "partial"
-				break
-			}
-		}
+	if b.Collection.Status == "ok" && hasIncompleteSections(b.Collection.Sections) {
+		b.Collection.Status = "partial"
 	}
 	b.Findings = findings(b)
 	return b, ordered, nil
+}
+
+func hasIncompleteSections(sections map[string]model.SectionStatus) bool {
+	for _, status := range sections {
+		if status.Status != "ok" && status.Status != "skipped" {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateOptions rejects category names that do not exist on the current platform.
+func ValidateOptions(opts model.Options) error {
+	return validateSelections(platformCollectors(opts), opts)
+}
+
+func validateSelections(collectors []Collector, opts model.Options) error {
+	known := make(map[string]bool, len(collectors))
+	for _, collector := range collectors {
+		known[collector.Section] = true
+	}
+	for _, filter := range []struct {
+		name   string
+		values []string
+	}{{"--include", opts.Include}, {"--exclude", opts.Exclude}} {
+		for _, section := range filter.values {
+			if !known[section] {
+				return fmt.Errorf("%s contains unknown category %q (valid categories: %s)", filter.name, section, strings.Join(knownSections(known), ", "))
+			}
+		}
+	}
+	return nil
+}
+
+func knownSections(known map[string]bool) []string {
+	sections := make([]string, 0, len(known))
+	for section := range known {
+		sections = append(sections, section)
+	}
+	sort.Strings(sections)
+	return sections
+}
+
+func runCollector(ctx context.Context, collector Collector) (result model.Result) {
+	started := time.Now()
+	result = model.Result{Section: collector.Section, Source: collector.Source, Status: "failed"}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result.Status = "failed"
+			result.Error = fmt.Sprintf("collector panic: %v", recovered)
+			result.Data = nil
+			result.Evidence = nil
+			result.Warnings = nil
+			result.MissingTools = nil
+			result.Truncated = false
+		}
+		result.DurationMS = time.Since(started).Milliseconds()
+	}()
+	localCtx, stop := context.WithTimeout(ctx, collector.Timeout)
+	defer stop()
+	data, evidence, warnings, missing, truncated, err := collector.Run(localCtx)
+	result.Data, result.Evidence = data, evidence
+	result.Warnings, result.MissingTools, result.Truncated = warnings, missing, truncated
+	result.Status = "ok"
+	if err != nil {
+		result.Status = "failed"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(localCtx.Err(), context.DeadlineExceeded) {
+			result.Status = "unavailable"
+		}
+	}
+	if (len(warnings) > 0 || len(missing) > 0 || truncated) && result.Status == "ok" {
+		result.Status = "partial"
+	}
+	result.Error = errorText(err)
+	return result
 }
 
 func selected(section string, opts model.Options) bool {
@@ -273,10 +329,24 @@ func findings(b model.Bundle) []model.Finding {
 			break
 		}
 	}
+	sort.SliceStable(findings, func(i, j int) bool {
+		return findingSeverityRank(findings[i].Severity) < findingSeverityRank(findings[j].Severity)
+	})
 	if len(findings) > 10 {
 		findings = findings[:10]
 	}
 	return findings
+}
+
+func findingSeverityRank(severity string) int {
+	switch severity {
+	case "critical":
+		return 0
+	case "warning":
+		return 1
+	default:
+		return 2
+	}
 }
 
 func errorText(err error) string {
@@ -310,13 +380,6 @@ func runJSON(ctx context.Context, name string, args ...string) (any, string, err
 
 func lookupCommand(name string) (string, error) { return exec.LookPath(name) }
 
-func mustText(name string, args ...string) string {
-	text, _ := runText(context.Background(), name, args...)
-	return text
-}
-
 func commandCollector(section, source string, timeout time.Duration, fn func(context.Context) (any, []model.Evidence, []string, []string, bool, error)) Collector {
 	return Collector{Section: section, Source: source, Timeout: timeout, Run: fn}
 }
-
-func platformName() string { return runtime.GOOS }

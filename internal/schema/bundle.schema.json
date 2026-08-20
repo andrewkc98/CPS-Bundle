@@ -9,12 +9,15 @@
     "identity": {"type": "object"},
     "hardware": {"type": "object"},
     "operating_system": {"type": "object"},
-    "storage": {"type": "object"},
-    "network": {"type": "object"},
-    "recent_errors": {"type": "array", "items": {"type": "object"}},
-    "software": {"type": "array", "items": {"type": "object"}},
+    "storage": {"type": "object", "properties": {"devices": {"type": "array", "items": {"type": "object"}}, "volumes": {"type": "array", "items": {"type": "object"}}, "health": {"type": "string"}}},
+    "network": {"type": "object", "properties": {"interfaces": {"type": "array", "items": {"type": "object"}}, "routes": {"type": "array", "items": {"type": "object"}}, "dns": {"type": "array", "items": {"type": "string"}}}},
+    "recent_errors": {"type": "array", "items": {"type": "object", "required": ["severity", "source", "message"], "properties": {"severity": {"enum": ["critical", "error"]}, "source": {"type": "string"}, "message": {"type": ["string", "null"]}}}},
+    "software": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": ["string", "null"]}, "version": {"type": ["string", "null"]}, "publisher": {"type": ["string", "null"]}, "install_date": {"type": ["string", "null"]}, "install_scope": {"type": "string"}, "source": {"type": "string"}, "architecture": {"type": ["string", "null"]}}}},
     "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
-    "collection": {"type": "object", "required": ["status", "sections", "warnings", "evidence_truncated"]}
+    "collection": {"type": "object", "required": ["status", "sections", "warnings", "evidence_truncated"], "properties": {"status": {"enum": ["ok", "partial"]}, "sections": {"type": "object", "additionalProperties": {"$ref": "#/$defs/section_status"}}, "warnings": {"type": "array", "items": {"type": "string"}}, "evidence_truncated": {"type": "boolean"}}}
   },
-  "$defs": {"finding": {"type": "object", "required": ["severity", "title", "detail", "suggested_action"], "properties": {"severity": {"enum": ["critical", "warning", "info"]}, "title": {"type": "string"}, "detail": {"type": "string"}, "suggested_action": {"type": "string"}, "evidence": {"type": "string"}}}}
+  "$defs": {
+    "finding": {"type": "object", "required": ["severity", "title", "detail", "suggested_action"], "properties": {"severity": {"enum": ["critical", "warning", "info"]}, "title": {"type": "string"}, "detail": {"type": "string"}, "suggested_action": {"type": "string"}, "evidence": {"type": "string"}}},
+    "section_status": {"type": "object", "required": ["status", "duration_ms"], "properties": {"status": {"enum": ["ok", "partial", "failed", "unavailable", "skipped"]}, "duration_ms": {"type": "integer"}, "source": {"type": "string"}, "warnings": {"type": "array", "items": {"type": "string"}}, "error": {"type": "string"}, "missing_tools": {"type": "array", "items": {"type": "string"}}, "truncated": {"type": "boolean"}}}
+  }
 }

@@ -1,6 +1,11 @@
 /dist/
 /build-check/
+/out/
 .gocache/
 *.partial
 *.zip
+/_build-check-*/
 /tmp/
+/hand-off.md
+.DS_Store
+/cps-bundle

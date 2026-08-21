@@ -183,7 +183,11 @@ func redactedValue(value any) any {
 
 func isNetworkIdentifier(value string) bool {
 	value = strings.TrimSpace(value)
-	if net.ParseIP(strings.Trim(value, "[]")) != nil {
+	ip := strings.Trim(value, "[]")
+	if zone := strings.LastIndex(ip, "%"); zone > 0 {
+		ip = ip[:zone]
+	}
+	if net.ParseIP(ip) != nil {
 		return true
 	}
 	if _, _, err := net.ParseCIDR(value); err == nil {

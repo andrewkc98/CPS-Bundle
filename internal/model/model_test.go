@@ -10,7 +10,7 @@ func TestRedactCoversStructuredAndFreeTextIdentifiers(t *testing.T) {
 	bundle := NewBundle(Options{CollectorVer: "test"}, time.Unix(0, 0))
 	bundle.Identity["hostname"] = "support-host"
 	bundle.OperatingSystem["last_updates"] = []string{"Requested-By: local-user"}
-	bundle.Network["dns"] = []string{"192.0.2.53", "resolver-label"}
+	bundle.Network["dns"] = []string{"192.0.2.53", "fe80::1%eth0", "resolver-label"}
 	bundle.Network["interfaces"] = []map[string]any{{
 		"name":      "eth0",
 		"addresses": []map[string]any{{"address": "192.0.2.10"}},
@@ -28,7 +28,7 @@ func TestRedactCoversStructuredAndFreeTextIdentifiers(t *testing.T) {
 		t.Fatalf("update history was not redacted: %#v", got)
 	}
 	dns := bundle.Network["dns"].([]string)
-	if dns[0] != "[REDACTED]" || dns[1] != "resolver-label" {
+	if dns[0] != "[REDACTED]" || dns[1] != "[REDACTED]" || dns[2] != "resolver-label" {
 		t.Fatalf("DNS identifiers were not redacted: %#v", dns)
 	}
 	interfaces := bundle.Network["interfaces"].([]map[string]any)

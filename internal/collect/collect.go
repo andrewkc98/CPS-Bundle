@@ -26,7 +26,7 @@ type Collector struct {
 
 func Confirm(opts model.Options) error {
 	if opts.Yes {
-		fmt.Println("CPS Bundle collecting the requested support categories with sensitive identifiers enabled (use --redact to mask common identifiers).")
+		fmt.Println(nonInteractiveConfirmation(opts))
 		return nil
 	}
 	if info, err := os.Stdin.Stat(); err != nil || info.Mode()&os.ModeCharDevice == 0 {
@@ -34,6 +34,9 @@ func Confirm(opts model.Options) error {
 	}
 	fmt.Println("CPS Bundle will collect hardware, OS/patch, disk, network, recent errors, and installed software.")
 	fmt.Println("This may include hostnames, usernames, serials, MAC/IP addresses, SSIDs, and event messages.")
+	if opts.Redact {
+		fmt.Println("Redaction is enabled: raw evidence will be omitted and common structured identifiers will be masked before packaging.")
+	}
 	fmt.Print("Continue? [y/N] ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
@@ -43,6 +46,13 @@ func Confirm(opts model.Options) error {
 		return errors.New("collection cancelled")
 	}
 	return nil
+}
+
+func nonInteractiveConfirmation(opts model.Options) string {
+	if opts.Redact {
+		return "CPS Bundle collecting the requested support categories with redaction enabled; raw evidence will be omitted and common structured identifiers will be masked before packaging."
+	}
+	return "CPS Bundle collecting the requested support categories with sensitive identifiers enabled (use --redact to mask common identifiers)."
 }
 
 func Run(opts model.Options) (model.Bundle, []model.Result, error) {

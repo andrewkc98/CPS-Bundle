@@ -20,6 +20,20 @@ func TestSelected(t *testing.T) {
 	}
 }
 
+func TestNonInteractiveConfirmationReflectsRedaction(t *testing.T) {
+	redacted := nonInteractiveConfirmation(model.Options{Redact: true})
+	if !strings.Contains(redacted, "redaction enabled") || !strings.Contains(redacted, "evidence will be omitted") {
+		t.Fatalf("redacted confirmation does not describe redaction: %q", redacted)
+	}
+	if strings.Contains(redacted, "sensitive identifiers enabled") {
+		t.Fatalf("redacted confirmation incorrectly claims sensitive identifiers are enabled: %q", redacted)
+	}
+	plain := nonInteractiveConfirmation(model.Options{})
+	if !strings.Contains(plain, "sensitive identifiers enabled") {
+		t.Fatalf("plain confirmation lost its sensitive-data warning: %q", plain)
+	}
+}
+
 func TestLimitUsesCanonicalTruncationMarker(t *testing.T) {
 	if got := limit("short", 5); got != "short" {
 		t.Fatalf("short value changed: %q", got)

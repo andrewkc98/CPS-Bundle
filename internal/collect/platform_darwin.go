@@ -401,9 +401,3 @@ func macSoftware(ctx context.Context, opts model.Options) (any, []model.Evidence
 	}
 	return apps, []model.Evidence{{Name: "evidence/software-system_profiler.json", Content: []byte(limit(raw, 12<<20))}}, nil, missing, false, nil
 }
-func limit(value string, max int) string {
-	if len(value) <= max {
-		return value
-	}
-	return value[:max] + fmt.Sprintln("[truncated]")
-}

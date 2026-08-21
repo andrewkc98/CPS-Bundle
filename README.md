@@ -12,7 +12,7 @@ sudo ./cps-bundle
 cps-bundle.exe
 ```
 
-The collector asks for confirmation because the default bundle includes useful support identifiers such as the hostname, serial number, MAC/IP addresses, SSIDs, and event messages. For unattended workflows use `--yes`; use `--redact` to mask common identifiers before packaging.
+The collector asks for confirmation because the default bundle includes useful support identifiers such as the hostname, serial number, MAC/IP addresses, SSIDs, and event messages. For unattended workflows use `--yes`. Use `--redact` when a smaller, lower-exposure bundle is preferable: common structured identifiers are replaced, event messages and update history are blanked with `[REDACTED]`, collector errors are redacted in the packaged log, and raw evidence files are omitted. Redaction reduces exposure but cannot guarantee anonymity.
 
 The result is a ZIP containing `00-summary.html`, `bundle.json`, the embedded schema, bounded evidence excerpts, a collection log, and a SHA-256 manifest. No network connection is made and no model or cloud service is required.
 
@@ -49,17 +49,57 @@ sudo install -m 0755 ./cps-bundle /usr/local/bin/cps-bundle
 sudo /usr/local/bin/cps-bundle --yes --output ./build-check
 ```
 
+macOS's unified-log command accepts whole-hour lookbacks. The collector therefore rounds `--since` up to the next whole hour; every positive value below one hour collects one hour.
+
+## Linux quick start
+
+Install Go 1.22 or newer and Git using your organization's approved package source, then verify the Go version before building. The remaining commands are the same on Ubuntu/Debian and RHEL/Fedora:
+
+```sh
+go version
+git clone https://github.com/andrewkc98/CPS-Bundle.git
+cd CPS-Bundle
+go build -trimpath -o cps-bundle .
+
+# Keep support output private. The ZIP is returned to the invoking sudo user.
+install -d -m 0700 "$HOME/cps-bundle-output"
+sudo ./cps-bundle collect --yes --output "$HOME/cps-bundle-output"
+```
+
+For a lower-exposure bundle, add `--redact`. Automated scripts or RMM tooling can add `--strict`; a degraded collection still writes its ZIP but exits with status 3 so automation can distinguish it from a complete collection.
+
+For an existing checkout, update and rebuild it with:
+
+```sh
+git pull --ff-only
+go build -trimpath -o cps-bundle .
+```
+
+To install the collector system-wide:
+
+```sh
+sudo install -m 0755 ./cps-bundle /usr/local/bin/cps-bundle
+install -d -m 0700 "$HOME/cps-bundle-output"
+sudo /usr/local/bin/cps-bundle collect --yes --output "$HOME/cps-bundle-output"
+```
+
+On RHEL/Fedora, RPM is the preferred software inventory source. On Ubuntu/Debian, `dpkg-query` is preferred. DNS falls back to `/etc/resolv.conf` when `resolvectl` is unavailable.
+
 ## Commands
 
 ```text
 cps-bundle [collect] [--output PATH] [--since 72h] [--yes] [--redact]
            [--include SECTION] [--exclude SECTION] [--no-enrichers]
-           [--max-events 2000]
+           [--max-events 2000] [--strict]
 cps-bundle schema
 cps-bundle version
 ```
 
 Collectors report partial coverage when an OS API or optional utility is unavailable. The first release supports Windows 10/11 and Server 2019+, macOS 13+, Ubuntu 22.04+, and RHEL 9+.
+
+By default, a degraded collection prints its non-OK sections and exits successfully because a useful bundle was written. `--strict` changes that completed-but-degraded outcome to exit status 3. Fatal collection or packaging failures use status 1, and unknown commands use status 2. Sections intentionally excluded by the user do not make a strict run degraded.
+
+If the collector reports an ownership or final-close error after naming an archive, a ZIP has already been published at that final path. Do not assume it is usable after a final-close error; inspect or remove that exact archive before retrying. The collector will not overwrite it.
 
 ## Development
 

@@ -20,6 +20,15 @@ func TestSelected(t *testing.T) {
 	}
 }
 
+func TestLimitUsesCanonicalTruncationMarker(t *testing.T) {
+	if got := limit("short", 5); got != "short" {
+		t.Fatalf("short value changed: %q", got)
+	}
+	if got, want := limit("abcdef", 3), "abc\n[truncated]\n"; got != want {
+		t.Fatalf("unexpected truncation: got %q, want %q", got, want)
+	}
+}
+
 func TestNewBundleHasAllSections(t *testing.T) {
 	b := model.NewBundle(model.Options{Since: 72 * time.Hour, CollectorVer: "test"}, time.Unix(0, 0))
 	if b.Identity == nil || b.Hardware == nil || b.OperatingSystem == nil || b.Storage == nil || b.Network == nil || b.RecentErrors == nil || b.Software == nil || b.Findings == nil {

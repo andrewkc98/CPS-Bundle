@@ -385,10 +385,3 @@ func windowsEventLevel(value any) (int, bool) {
 		return 0, false
 	}
 }
-
-func limit(value string, max int) string {
-	if len(value) <= max {
-		return value
-	}
-	return value[:max] + "\n[truncated]\n"
-}

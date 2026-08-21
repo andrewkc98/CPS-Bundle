@@ -42,6 +42,10 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 	if err := schema.ValidateBundle(doc); err != nil {
 		return "", err
 	}
+	identity, err := parseSudoIdentity(os.Getenv)
+	if err != nil {
+		return "", err
+	}
 	temp, err := os.MkdirTemp("", "cps-bundle-")
 	if err != nil {
 		return "", err
@@ -143,25 +147,15 @@ func Write(opts model.Options, doc model.Bundle, results []model.Result) (string
 		return "", err
 	}
 	partial := destination + ".partial"
-	created, err := zipDir(partial, temp, files)
+	file, created, err := zipDir(partial, temp, files)
 	if err != nil {
 		if created {
 			os.Remove(partial)
 		}
 		return "", err
 	}
-	if err := os.Rename(partial, destination); err != nil {
-		os.Remove(partial)
+	if err := finalizeArchive(file, partial, destination, identity, createdDirs); err != nil {
 		return "", err
-	}
-	identity, err := parseSudoIdentity(os.Getenv)
-	if err != nil {
-		return "", fmt.Errorf("archive exists at %s, but ownership correction could not be configured: %w", destination, err)
-	}
-	if identity != nil {
-		if err := applyOwnership(destination, createdDirs, identity.uid, identity.gid); err != nil {
-			return "", fmt.Errorf("archive exists at %s, but ownership correction failed: %w", destination, err)
-		}
 	}
 	return destination, nil
 }
@@ -260,12 +254,11 @@ func parseID(value string) (int, error) {
 	return int(parsed), nil
 }
 
-func zipDir(destination, root string, files map[string][]byte) (bool, error) {
+func zipDir(destination, root string, files map[string][]byte) (*os.File, bool, error) {
 	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	defer file.Close()
 	archive := zip.NewWriter(file)
 	paths := make([]string, 0, len(files))
 	for path := range files {
@@ -276,22 +269,26 @@ func zipDir(destination, root string, files map[string][]byte) (bool, error) {
 		entry, err := archive.Create(filepath.ToSlash(path))
 		if err != nil {
 			archive.Close()
-			return true, err
+			file.Close()
+			return nil, true, err
 		}
 		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 		if err != nil {
 			archive.Close()
-			return true, err
+			file.Close()
+			return nil, true, err
 		}
 		if _, err := io.Copy(entry, bytes.NewReader(data)); err != nil {
 			archive.Close()
-			return true, err
+			file.Close()
+			return nil, true, err
 		}
 	}
 	if err := archive.Close(); err != nil {
-		return true, err
+		file.Close()
+		return nil, true, err
 	}
-	return true, nil
+	return file, true, nil
 }
 
 func appendSummaryWarning(summaryHTML []byte, warning string) []byte {

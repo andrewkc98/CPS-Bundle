@@ -380,6 +380,14 @@ func runJSON(ctx context.Context, name string, args ...string) (any, string, err
 
 func lookupCommand(name string) (string, error) { return exec.LookPath(name) }
 
+// limit caps collected text and makes the truncation explicit in the evidence.
+func limit(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "\n[truncated]\n"
+}
+
 func commandCollector(section, source string, timeout time.Duration, fn func(context.Context) (any, []model.Evidence, []string, []string, bool, error)) Collector {
 	return Collector{Section: section, Source: source, Timeout: timeout, Run: fn}
 }

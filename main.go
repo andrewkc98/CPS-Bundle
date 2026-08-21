@@ -31,9 +31,13 @@ func main() {
 		fmt.Print(schema.Document)
 		return
 	case "collect":
-		if err := runCollect(args); err != nil {
+		exitCode, err := runCollect(args)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "cps-bundle: %v\n", err)
 			os.Exit(1)
+		}
+		if exitCode != 0 {
+			os.Exit(exitCode)
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "cps-bundle: unknown command %q (use collect, schema, or version)\n", command)
@@ -41,7 +45,7 @@ func main() {
 	}
 }
 
-func runCollect(args []string) error {
+func runCollect(args []string) (int, error) {
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	output := fs.String("output", "", "directory or .zip destination")
@@ -52,21 +56,22 @@ func runCollect(args []string) error {
 	exclude := fs.String("exclude", "", "comma-separated categories to skip")
 	noEnrichers := fs.Bool("no-enrichers", false, "do not use optional installed utilities")
 	maxEvents := fs.Int("max-events", 2000, "maximum normalized recent errors")
+	strict := fs.Bool("strict", false, "exit 3 after writing a bundle with failed, unavailable, or partial sections")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return nil
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
 	if *since <= 0 {
-		return errors.New("--since must be positive")
+		return 0, errors.New("--since must be positive")
 	}
 	if *maxEvents < 1 {
-		return errors.New("--max-events must be positive")
+		return 0, errors.New("--max-events must be positive")
 	}
 
 	if err := collect.RequirePrivilege(); err != nil {
-		return err
+		return 0, err
 	}
 	opts := model.Options{
 		Output:       *output,
@@ -80,27 +85,34 @@ func runCollect(args []string) error {
 		CollectorVer: version,
 	}
 	if err := collect.ValidateOptions(opts); err != nil {
-		return err
+		return 0, err
 	}
 	if err := collect.Confirm(opts); err != nil {
-		return err
+		return 0, err
 	}
 	doc, results, err := collect.Run(opts)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if opts.Redact {
 		model.Redact(&doc)
 	}
 	path, err := bundle.Write(opts, doc, results)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	fmt.Printf("Support bundle written to %s\n", path)
 	if summary := nonOKSectionSummary(results); summary != "" {
 		fmt.Printf("Collection completed with non-ok sections: %s\n", summary)
 	}
-	return nil
+	return strictExitCode(*strict, results), nil
+}
+
+func strictExitCode(strict bool, results []model.Result) int {
+	if strict && nonOKSectionSummary(results) != "" {
+		return 3
+	}
+	return 0
 }
 
 func nonOKSectionSummary(results []model.Result) string {

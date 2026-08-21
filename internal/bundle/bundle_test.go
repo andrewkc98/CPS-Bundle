@@ -145,6 +145,21 @@ func TestParseSudoIdentity(t *testing.T) {
 	}
 }
 
+func TestWriteRejectsInvalidSudoIdentityBeforeCreatingArchive(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "result.zip")
+	t.Setenv("SUDO_UID", "not-a-number")
+	t.Setenv("SUDO_GID", "20")
+	opts := model.Options{Output: destination, Since: time.Hour, CollectorVer: "test", Yes: true}
+	doc := model.NewBundle(opts, time.Unix(0, 0))
+	if _, err := Write(opts, doc, nil); err == nil || !strings.Contains(err.Error(), "invalid SUDO_UID") {
+		t.Fatalf("error = %v, want invalid SUDO_UID", err)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("invalid sudo identity created an archive: %v", err)
+	}
+}
+
 func TestDestinationPathDoesNotCreateOutputDirectories(t *testing.T) {
 	dir := t.TempDir()
 	output := filepath.Join(dir, "nested", "output")

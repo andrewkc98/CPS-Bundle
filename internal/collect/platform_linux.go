@@ -289,12 +289,6 @@ func readText(path string) string {
 	return string(data)
 }
 func fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
-func limit(value string, max int) string {
-	if len(value) <= max {
-		return value
-	}
-	return value[:max] + "\n[truncated]\n"
-}
 
 func linuxCPUDescription(value any, fallback string) (string, string) {
 	modelName, vendor := fallback, ""
